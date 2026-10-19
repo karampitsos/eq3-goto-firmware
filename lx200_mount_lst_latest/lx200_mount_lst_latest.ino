@@ -49,7 +49,15 @@ const float SLEW_MAX_SPEED = 4000.0;  // max speed during GOTO run()
 // --- Serial / state ---
 String inputBuffer = "";
 bool   capturing   = false;
-float  currentSlewSpeed = SPEED_FIND;
+
+// Speeds (Steps / Second) of the :M# moves on each axis: the rates above, or set
+// in degrees per second with :RA# / :RE# (custom tracking). Limited to SLEW_MAX_SPEED.
+float  raSlewSpeed  = SPEED_FIND;
+float  decSlewSpeed = SPEED_FIND;
+
+// RA tracking: :AL# (Land) switches it off, :AA# / :AP# on again
+bool   trackingOn = true;
+float  raBaseSpeed() { return trackingOn ? SIDEREAL_SPEED : 0.0; }
 
 enum MountState { TRACKING, SLEWING };
 MountState mountState = TRACKING;
@@ -92,7 +100,7 @@ void loop() {
     stepperZ.run();
     if (stepperY.distanceToGo() == 0 && stepperZ.distanceToGo() == 0) {
       mountState = TRACKING;
-      stepperZ.setSpeed(SIDEREAL_SPEED);
+      stepperZ.setSpeed(raBaseSpeed());
       stepperY.setSpeed(0);
     }
   } else {
@@ -130,35 +138,48 @@ void readLX200Serial() {
 void parseLX200Command(String cmd) {
 
   // --- Motion start ---
+  // Meade: west increases the hour angle, north increases the declination
   if (cmd == "Mn" || cmd == "Ms" || cmd == "Me" || cmd == "Mw")
     mountState = TRACKING;
 
-  if      (cmd == "Mn") stepperY.setSpeed(currentSlewSpeed);
-  else if (cmd == "Ms") stepperY.setSpeed(-currentSlewSpeed);
-  else if (cmd == "Me") stepperZ.setSpeed(SIDEREAL_SPEED + currentSlewSpeed);
-  else if (cmd == "Mw") stepperZ.setSpeed(SIDEREAL_SPEED - currentSlewSpeed);
+  if      (cmd == "Mn") stepperY.setSpeed(DEC_DIR * decSlewSpeed);
+  else if (cmd == "Ms") stepperY.setSpeed(-DEC_DIR * decSlewSpeed);
+  else if (cmd == "Mw") stepperZ.setSpeed(raBaseSpeed() + RA_DIR * raSlewSpeed);
+  else if (cmd == "Me") stepperZ.setSpeed(raBaseSpeed() - RA_DIR * raSlewSpeed);
 
   // --- Motion stop ---
   else if (cmd == "Qn" || cmd == "Qs") stepperY.setSpeed(0);
-  else if (cmd == "Qe" || cmd == "Qw") stepperZ.setSpeed(SIDEREAL_SPEED);
+  else if (cmd == "Qe" || cmd == "Qw") stepperZ.setSpeed(raBaseSpeed());
   else if (cmd == "Q") {
     mountState = TRACKING;
     stepperY.setSpeed(0);
-    stepperZ.setSpeed(SIDEREAL_SPEED);
+    stepperZ.setSpeed(raBaseSpeed());
   }
 
   // --- Slew rates ---
-  else if (cmd == "RG") currentSlewSpeed = SPEED_GUIDE;
-  else if (cmd == "RC") currentSlewSpeed = SPEED_CENTER;
-  else if (cmd == "RM") currentSlewSpeed = SPEED_FIND;
-  else if (cmd == "RS") currentSlewSpeed = SPEED_MAX;
+  else if (cmd == "RG") raSlewSpeed = decSlewSpeed = SPEED_GUIDE;
+  else if (cmd == "RC") raSlewSpeed = decSlewSpeed = SPEED_CENTER;
+  else if (cmd == "RM") raSlewSpeed = decSlewSpeed = SPEED_FIND;
+  else if (cmd == "RS") raSlewSpeed = decSlewSpeed = SPEED_MAX;
+
+  // --- Axis rates in degrees per second (LX200 GPS :RAd.d# / :REd.d#) ---
+  else if (cmd.startsWith("RA")) raSlewSpeed  = fabs(cmd.substring(2).toFloat()) * STEPS_PER_DEG_RA;
+  else if (cmd.startsWith("RE")) decSlewSpeed = fabs(cmd.substring(2).toFloat()) * STEPS_PER_DEG_DEC;
+
+  // --- Tracking off / on (Meade Land / AltAz / Polar alignment), keeps a move in progress ---
+  else if (cmd == "AL" || cmd == "AA" || cmd == "AP") {
+    bool on = (cmd != "AL");
+    if (on != trackingOn && mountState == TRACKING)
+      stepperZ.setSpeed(stepperZ.speed() + (on ? SIDEREAL_SPEED : -SIDEREAL_SPEED));
+    trackingOn = on;
+  }
 
   // --- Current coordinates ---
   else if (cmd == "GR") Serial.print(getFormattedRA()  + "#");
   else if (cmd == "GD") Serial.print(getFormattedDec() + "#");
 
   // --- Status / version ---
-  else if (cmd == "GW")  Serial.print("PT#");
+  else if (cmd == "GW")  Serial.print(trackingOn ? "PT#" : "PN#");
   else if (cmd == "GVP") Serial.print("Arduino Mount#");
   else if (cmd == "GVN") Serial.print("v2.0#");
   else if (cmd == "GVD") Serial.print("Jan 01 2026#");
@@ -258,7 +279,7 @@ void parseLX200Command(String cmd) {
   stepperZ.setCurrentPosition((long)(RA_DIR * ha * STEPS_PER_HOUR_RA));
   stepperY.setCurrentPosition(targetDecSteps);
 
-  stepperZ.setSpeed(SIDEREAL_SPEED);   // setCurrentPosition() zeroed speed; restore tracking
+  stepperZ.setSpeed(raBaseSpeed());    // setCurrentPosition() zeroed speed; restore tracking
 
   Serial.print("Synced#");   // any '#'-terminated string; driver just reads it
   }
@@ -333,7 +354,7 @@ String hoursToHMS(float hours) {
 
 String getFormattedRA() {
   float ha = RA_DIR * stepperZ.currentPosition() / STEPS_PER_HOUR_RA;
-  float raH = (timeKnown && dateKnown) ? (currentLST() - ha) : ha;  // fallback pre-connect
+  float raH = currentLST() - ha;   // LST is 0 until the time is set, as :GS# reports
   return hoursToHMS(raH);
 }
 
